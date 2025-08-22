@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
+import scipy.ndimage
+
+import mcubes
+import trimesh
 
 import matplotlib.pyplot as plt
 
@@ -173,8 +177,289 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     disps = np.stack(disps, 0)
 
     return rgbs, disps
+    
+
+# def extract_mesh(
+#     network_fn,
+#     network_query_fn,
+#     resolution=512,
+#     bounding_box=([-1.5, 1.5], [-1.5, 1.5], [-1.5, 1.5]),
+#     threshold=25.0,
+#     save_path="mesh_colored.ply",
+#     smooth_sigma=0.1,
+#     train_poses=None,
+# ):
+#     """
+#     Enhanced mesh extraction from NeRF with view-dependent color correction.
+
+#     Args:
+#         network_fn: The NeRF model.
+#         network_query_fn: Query function with positional encoding.
+#         resolution: Base voxel grid resolution.
+#         bounding_box: 3D bounds of the scene.
+#         threshold: Density threshold for surface extraction.
+#         save_path: Path to save the mesh.
+#         smooth_sigma: Gaussian smoothing strength.
+#         train_poses: Camera poses for view direction optimization.
+#     """
+#     print("🔍 Initializing mesh extraction...")
+    
+#     # Use fine network if available
+#     if hasattr(network_fn, 'fine'):
+#         network_fn = network_fn.fine
+#         print("✅ Using fine network for extraction")
+
+#     # =====================================================================
+#     # 1. Create 3D Grid
+#     # =====================================================================
+#     x = np.linspace(*bounding_box[0], resolution)
+#     y = np.linspace(*bounding_box[1], resolution)
+#     z = np.linspace(*bounding_box[2], resolution)
+#     grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), -1)
+#     coords = torch.from_numpy(grid.reshape(-1, 3)).float().to(device)
+
+#     # =====================================================================
+#     # 2. Compute Global View Parameters
+#     # =====================================================================
+#     median_dir = None
+#     scene_center = None
+    
+#     if train_poses is not None:
+#         # Calculate median view direction from training cameras
+#         view_dirs = torch.stack([p[:3, 2] for p in train_poses])
+#         median_dir = torch.median(view_dirs, dim=0)[0]
+#     else:
+#         # Calculate scene center for view direction fallback
+#         scene_center = torch.tensor([
+#             (bounding_box[0][0] + bounding_box[0][1])/2,
+#             (bounding_box[1][0] + bounding_box[1][1])/2,
+#             (bounding_box[2][0] + bounding_box[2][1])/2
+#         ]).to(device)
+
+#     # =====================================================================
+#     # 3. Density Field Calculation
+#     # =====================================================================
+#     print("📊 Querying density field...")
+#     volume = np.zeros((resolution, resolution, resolution), dtype=np.float32)
+#     chunk = 2**18  # Reduced chunk size for memory safety
+    
+#     with torch.no_grad():
+#         sigmas = []
+#         for i in range(0, coords.shape[0], chunk):
+#             pts = coords[i:i+chunk]
+            
+#             # Temporary viewdirs for density query
+#             dummy_viewdirs = torch.zeros_like(pts)  # Viewdirs not needed for density
+            
+#             raw = network_query_fn(
+#                 pts.unsqueeze(1),
+#                 viewdirs=dummy_viewdirs,
+#                 network_fn=network_fn
+#             )
+#             sigmas.append(raw[..., 3].squeeze(1).cpu().numpy())
+        
+#         volume = np.concatenate(sigmas).reshape(resolution, resolution, resolution)
+
+#     # =====================================================================
+#     # 4. Marching Cubes
+#     # =====================================================================
+#     print("⚙️ Running marching cubes...")
+#     try:
+#         # Auto-threshold using density statistics
+#         valid_densities = volume[volume > threshold]
+#         if len(valid_densities) == 0:
+#             raise ValueError("No valid densities found - check threshold")
+            
+#         auto_threshold = np.percentile(valid_densities, 75)
+#         verts, faces = mcubes.marching_cubes(volume, auto_threshold)
+#     except Exception as e:
+#         print(f"⚠️ Marching cubes failed: {str(e)}")
+#         return
+
+#     # =====================================================================
+#     # 5. Vertex Color Sampling (Critical Fix)
+#     # =====================================================================
+#     print("🎨 Sampling vertex colors...")
+#     verts_tensor = torch.from_numpy(verts).float().to(device)
+#     vertex_colors = []
+#     chunk = 2**18  # Smaller chunk for color sampling
+
+#     # Compute view directions for vertices
+#     if train_poses is not None:
+#         vertex_viewdirs = median_dir.repeat(verts_tensor.shape[0], 1).to(device)
+#     else:
+#         vertex_viewdirs = scene_center - verts_tensor
+#         vertex_viewdirs = F.normalize(vertex_viewdirs, p=2, dim=-1)
+
+#     with torch.no_grad():
+#         for i in range(0, verts_tensor.shape[0], chunk):
+#             pts = verts_tensor[i:i+chunk]
+#             dirs = vertex_viewdirs[i:i+chunk]
+            
+#             raw = network_query_fn(
+#                 pts.unsqueeze(1),  # Shape [N,1,3]
+#                 viewdirs=dirs,
+#                 network_fn=network_fn
+#             )
+#             rgb = torch.sigmoid(raw[..., :3])
+#             vertex_colors.append(rgb.squeeze(1).cpu().numpy())
+    
+#     vertex_colors = np.concatenate(vertex_colors, 0)
+#     vertex_colors = (np.clip(vertex_colors, 0, 1) * 255).astype(np.uint8)
+
+#     # =====================================================================
+#     # 6. Mesh Post-Processing
+#     # =====================================================================
+#     print("🧼 Cleaning mesh...")
+#     mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vertex_colors)
+    
+#     # Filter small components
+#     components = mesh.split()
+#     if len(components) > 1:
+#         keep_components = [
+#             c for c in components 
+#             if c.vertices.shape[0] > 0.02 * verts.shape[0]
+#         ]
+#         mesh = trimesh.util.concatenate(keep_components)
+
+#     # Optional smoothing
+#     if smooth_sigma > 0:
+#         mesh = trimesh.smoothing.filter_laplacian(mesh, iterations=2)
+
+#     # =====================================================================
+#     # 7. Final Export
+#     # =====================================================================
+#     print(f"💾 Saving mesh to {save_path}")
+#     mesh.export(save_path)
+#     print("✅ Mesh extraction complete!")
+    
+def extract_mesh(
+    network_fn,
+    network_query_fn,
+    resolution=256,
+    bounding_box=([-1.5, 1.5], [-1.5, 1.5], [-1.5, 1.5]),
+    threshold=30,
+    save_path="mesh_colored.ply",
+    smooth_sigma=0,
+):
+    """
+    Enhanced mesh extraction from NeRF with denoising inspired by video rendering.
+
+    Args:
+        network_fn: The NeRF model.
+        network_query_fn: Query function with positional encoding.
+        resolution: Base voxel grid resolution (not used in multi-resolution mode).
+        bounding_box: 3D bounds of the scene.
+        threshold: Density threshold for surface extraction.
+        save_path: Path to save the mesh.
+        smooth_sigma: Std dev for Gaussian smoothing (in voxel units).
+    """
+    from scipy.ndimage import zoom, gaussian_filter
+    print("🔍 Sampling density field for mesh extraction…")
+    
+    # Use fine network if available
+    if hasattr(network_fn, 'fine'):
+        network_fn = network_fn.fine
+        print("✅ Using fine network for extraction")
+    
+    # 1) Build 3D grid of points
+    x = np.linspace(*bounding_box[0], resolution)
+    y = np.linspace(*bounding_box[1], resolution)
+    z = np.linspace(*bounding_box[2], resolution)
+    grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), -1).astype(np.float32)
+    coords = torch.from_numpy(grid.reshape(-1, 3)).to(device)  # (N,3)
+
+    # 2) Query densities
+    print("📊 Querying density field...")
+    sigmas = []
+    chunk = 2**18
+    with torch.no_grad():
+        for i in range(0, coords.shape[0], chunk):
+            pts = coords[i:i+chunk]           # (B,3)
+            pts_r = pts.unsqueeze(1)          # (B,1,3)
+            dummy_dirs = torch.zeros(pts.shape[0], 3, device=pts.device)
+            raw = network_query_fn(
+                pts_r, viewdirs=dummy_dirs, network_fn=network_fn
+            )                                 # (B,1,4) or (B,1,5)
+            sigma = raw[..., 3].view(-1)       # (B,)
+            sigmas.append(sigma.cpu().numpy())
+    volume = np.concatenate(sigmas, 0).reshape(resolution, resolution, resolution)
+
+    # 3) Denoise density field using Gaussian smoothing
+    print("🧹 Applying Gaussian smoothing...")
+    volume = scipy.ndimage.gaussian_filter(volume, sigma=smooth_sigma)
+
+    # 4) Extract mesh using Marching Cubes
+    print("⚙️ Running marching cubes…")
+    verts, faces = mcubes.marching_cubes(volume, threshold)
+
+    # 5) Convert mesh vertices to world coordinates
+    scale = np.array([
+        bounding_box[0][1] - bounding_box[0][0],
+        bounding_box[1][1] - bounding_box[1][0],
+        bounding_box[2][1] - bounding_box[2][0],
+    ]) / resolution
+    verts = verts * scale + np.array([
+        bounding_box[0][0],
+        bounding_box[1][0],
+        bounding_box[2][0],
+    ])
+
+    # 6) Query RGB color for each vertex
+    print("🎨 Sampling vertex colors…")
+    vertex_colors = []
+    chunk = 2**18
+    vert_coords = torch.from_numpy(verts.astype(np.float32)).to(device)
+    with torch.no_grad():
+        for i in range(0, vert_coords.shape[0], chunk):
+            pts = vert_coords[i:i+chunk]
+            pts_r = pts.unsqueeze(1)
+            dummy_dirs = torch.zeros(pts.shape[0], 3, device=pts.device)
+            raw = network_query_fn(pts_r, viewdirs=dummy_dirs, network_fn=network_fn)
+            rgb = torch.sigmoid(raw[..., :3])
+            rgb = rgb.view(-1, 3)
+            vertex_colors.append(rgb.cpu().numpy())
+    vertex_colors = np.concatenate(vertex_colors, 0)
+    vertex_colors = np.clip(vertex_colors, 0.0, 1.0)
+    vertex_colors = (vertex_colors * 255).astype(np.uint8)
 
 
+    # 7) Clean mesh: Remove disconnected components
+    print("🧼 Removing outlier mesh components...")
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vertex_colors)
+    # Split mesh into connected components and find largest component (main object)
+    components = mesh.split(only_watertight=False)
+    mesh = max(components, key=lambda comp: comp.vertices.shape[0])
+    
+    components = mesh.split()
+    if len(components) > 1:
+        # Keep only the largest components that make up 95% of the mesh
+        components.sort(key=lambda comp: comp.vertices.shape[0], reverse=True)
+        total_verts = sum(c.vertices.shape[0] for c in components)
+        keep_verts = 0
+        keep_components = []
+        for comp in components:
+            keep_verts += comp.vertices.shape[0]
+            keep_components.append(comp)
+            if keep_verts / total_verts > 0.95:
+                break
+        
+        mesh = trimesh.util.concatenate(keep_components)
+
+    # Optional: Add bounding box filter for additional cleaning
+    bbox_min = np.array(bounding_box)[:, 0]
+    bbox_max = np.array(bounding_box)[:, 1]
+    in_bbox_mask = np.all(
+        (mesh.vertices >= bbox_min) & 
+        (mesh.vertices <= bbox_max), axis=1)
+    mesh.update_vertices(in_bbox_mask)
+
+    # 8) Export the final mesh with vertex colors
+    print(f"💾 Saving colored mesh to {save_path}")
+    # mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vertex_colors)
+    mesh.export(save_path)
+
+    
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
@@ -528,6 +813,8 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
 
+    parser.add_argument("--N_iter", type=int, default=100000, help='number of training iterations')
+
     return parser
 
 
@@ -535,7 +822,7 @@ def train():
 
     parser = config_parser()
     args = parser.parse_args()
-
+            
     # Load data
     K = None
     if args.dataset_type == 'llff':
@@ -698,7 +985,7 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 200000 + 1
+    N_iters = args.N_iter + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -808,6 +1095,19 @@ def train():
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
+            # Save 3D mesh
+            mesh_path = os.path.join(basedir, expname,
+                                     f'{expname}_mesh_{i:06d}.ply')
+            extract_mesh(
+                network_fn=render_kwargs_test['network_fine'] if render_kwargs_test['network_fine'] is not None else render_kwargs_test['network_fn'],
+                network_query_fn=render_kwargs_train['network_query_fn'],
+                resolution=384,
+                bounding_box=[[-1.5, 1.5], [-1.5, 1.5], [-1.5, 1.5]],
+                threshold=25.0,
+                save_path=mesh_path
+            )
+
+            
             # if args.use_viewdirs:
             #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
             #     with torch.no_grad():
